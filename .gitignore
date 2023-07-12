@@ -2,7 +2,9 @@
 __pycache__/
 *.py[cod]
 *$py.class
-
+training/data*
+*.swl
+*.swp
 # C extensions
 *.so
 
