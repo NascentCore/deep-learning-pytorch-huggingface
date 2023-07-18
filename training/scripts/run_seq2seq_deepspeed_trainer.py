@@ -45,10 +45,7 @@ def postprocess_text(preds, labels):
 def parse_arge():
     """Parse the arguments."""
     parser = argparse.ArgumentParser()
-    parser.add_argument('--local_rank', default=-1, type=int, help='node rank for distributed training')
-
-
-   # add model id and dataset path argument
+    # add model id and dataset path argument
     parser.add_argument("--model_id", type=str, default="google/flan-t5-xl", help="Model id to use for training.")
     parser.add_argument("--dataset_path", type=str, default="data", help="Path to the already processed dataset.")
     parser.add_argument(
@@ -80,32 +77,59 @@ def parse_arge():
     return args
 
 
+class CustomIterableDataset(IterableDataset):
+    
+    def __init__(self, data_file, num_lines):
+        self.data_file = data_file
+        self.start = 0
+        self.end = num_lines
+        self.word_size = int(os.environ.get('WORLD_SIZE'))
+        self.rank = int(os.environ.get('RANK'))
+    
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        total_data_loader_count = worker_info.num_workers * self.word_size
+        per_worker_lines = int(math.ceil((self.end - self.start) / total_data_loader_count))
+        iter_start = self.start + (self.rank * worker_info.num_workers + worker_info.id) * per_worker_lines
+        while True:
+            with open(self.data_file, 'rt', encoding='utf-8') as f:
+                # 跳过区间之前的数据
+                for _ in range(iter_start):
+                    f.readline()
+                print(f"系统进程号:{os.getpid()} rank编号:{} dataloader子进程编号:{worker_info.id}, 开始加载数据")
+                # 开始加载数据，长度为per_worker_lines
+                for _ in range(per_worker_lines):
+                    line = f.readline().strip()
+                    print(f"系统进程号{os.getpid()}, 加载的数据{line.strip()}")
+                    yield line
+
+
 def training_function(args):
     # set seed
     set_seed(args.seed)
-    
-    torch.distributed.init_process_group(backend="nccl")
-    print("Use GPU: {} for training".format(args.local_rank))
 
     # load dataset from disk and tokenizer
-    train_dataset = load_from_disk(os.path.join(args.dataset_path, "train"))
-    eval_dataset = load_from_disk(os.path.join(args.dataset_path, "eval"))
+    #train_dataset = load_from_disk(os.path.join(args.dataset_path, "train"))
+    #eval_dataset = load_from_disk(os.path.join(args.dataset_path, "eval"))
+    train_file_lines = sum(1 for line in open(os.path.join(args.dataset_path, "train"))
+    eval_file_lines = sum(1 for line in open(os.path.join(args.dataset_path, "eval"))
+    train_dataset = CustomIterableDataset(os.path.join(args.dataset_path, "train"), train_file_lines)
+    eval_dataset = CustomIterableDataset(os.path.join(args.dataset_path, "eval"), eval_file_lines)
+
+
     tokenizer = AutoTokenizer.from_pretrained(args.model_id)
     # load model from the hub
     model = AutoModelForSeq2SeqLM.from_pretrained(
         args.model_id,
         use_cache=False if args.gradient_checkpointing else True,  # this is needed for gradient checkpointing
     )
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True)
-    
+
     # we want to ignore tokenizer pad token in the loss
     label_pad_token_id = -100
     # Data collator
     data_collator = DataCollatorForSeq2Seq(
         tokenizer, model=model, label_pad_token_id=label_pad_token_id, pad_to_multiple_of=8
     )
-    train_sampler = DistributedSampler(train_dataset)
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True, sampler=train_sampler)
 
     # Define compute metrics function
     def compute_metrics(eval_preds):
@@ -156,16 +180,31 @@ def training_function(args):
         hub_strategy="every_save",
         hub_model_id=args.repository_id if args.repository_id else None,
         hub_token=args.hf_token,
-    )
+        local_rank=int(os.environ.get('LOCAL_RANK', -1)),
+        )
+
+    def collate_fn(examples):
+        print("collate_fn input:"+examples)
+        pixel_values = torch.stack([example[0] for example in examples])
+        labels = torch.tensor([example[1] for example in examples])
+        return {"x":pixel_values, "labels":labels}
+
+    class MyTrainer(Seq2SeqTrainer):
+        def compute_loss(self, model, inputs, return_outputs=False):
+            outputs = model(inputs["x"])
+            target = inputs["labels"]
+            loss = F.nll_loss(outputs, target)
+            return (loss, outputs) if return_outputs else loss
 
     # Create Trainer instance
-    trainer = Seq2SeqTrainer(
+    # trainer = Seq2SeqTrainer(
+    trainer = MyTrainer(
         model=model,
         args=training_args,
-        #train_dataset=train_dataset,
-        #eval_dataset=eval_dataset,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
         #data_collator=data_collator,
-        data_loader=train_loader,
+        data_collator=collate_fn,
         compute_metrics=compute_metrics,
     )
 
